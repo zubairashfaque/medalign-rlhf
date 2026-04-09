@@ -146,20 +146,55 @@ PubMedQA `pqa_artificial` → BGE embeddings (batch 64, normalized) → `IndexFl
 ## Step-by-Step Implementation Guide
 
 ### Phase 0 — One-time setup (laptop, ~10 min)
-1. HF account at https://huggingface.co (username `Zubairash`).
-2. HF token (write scope): https://huggingface.co/settings/tokens.
-3. OpenAI API key (only for DPO judge + LLM-as-judge eval).
-4. Empty GitHub repo: `https://github.com/zubairashfaque/medalign-rlhf`.
-5. Install Poetry: `curl -sSL https://install.python-poetry.org | python3 -`.
-6. From repo root:
-   ```bash
-   cd "/home/zubair-ashfaque/GitHubProject/medalign-rlhf"
-   git init && git add . && git commit -m "initial scaffolding"
-   git remote add origin https://github.com/zubairashfaque/medalign-rlhf.git
-   git push -u origin main
-   poetry install
-   poetry run huggingface-cli login   # paste HF token
-   ```
+
+**Goal:** Get every credential and tool installed once so the rest of the pipeline runs without surprises. This is the boring-but-mandatory plumbing that connects laptop ↔ GitHub ↔ Hugging Face Hub ↔ Kaggle.
+
+#### Why each piece exists
+
+| Piece | Why we need it |
+|---|---|
+| **HF account + write-scope token** | Every artifact (datasets, adapters, GGUF, RAG index) is pushed to HF Hub with `push_to_hub()`. The token authenticates those calls. *Write* scope is required — read-only tokens can't push. |
+| **OpenAI API key** | Only Phase 3 (`kaggle_02_generate_dpo_pairs.ipynb`) and the LLM-as-judge eval in Phase 7 use it. Cost ≈ $5–10 total with `gpt-4o-mini`. Skip if you don't run those steps. |
+| **GitHub repo** | This is the real backbone of the artifact flow. The Kaggle notebooks `pip install git+https://github.com/zubairashfaque/medalign-rlhf` to get the source — so any code change you want Kaggle to see must be pushed to GitHub *first*. |
+| **Poetry (not bare venv)** | `poetry.lock` pins exact versions of ~150 transitive deps so Kaggle and laptop run the same code. Python 3.10–3.12 only (transformers/trl/peft constraint). |
+| **`huggingface-cli login`** | Writes the token to `~/.cache/huggingface/token`. Every subsequent `push_to_hub()` / `load_dataset()` call reads it from there — no need to set env vars. |
+
+#### Step by step
+
+```bash
+# 1. Create the HF account at https://huggingface.co (username: Zubairash)
+# 2. Generate a WRITE-scope token at https://huggingface.co/settings/tokens
+# 3. (Optional) Get an OpenAI key if running Phases 3 / 7-judge
+
+# 4. Install Poetry (one-time, system-wide)
+curl -sSL https://install.python-poetry.org | python3 -
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc
+
+# 5. Initialize the repo (the git remote was created via the GitHub web UI)
+cd "/home/zubair-ashfaque/GitHubProject/medalign-rlhf"
+git init && git add . && git commit -m "initial scaffolding"
+git remote add origin https://github.com/zubairashfaque/medalign-rlhf.git
+git push -u origin main
+
+# 6. Install all Python deps from poetry.lock
+poetry install
+
+# 7. Cache the HF token locally
+poetry run huggingface-cli login   # paste the write token when prompted
+```
+
+#### Verify
+
+```bash
+poetry run python -c "import medalign; print('package import ok')"
+poetry run huggingface-cli whoami        # should print: Zubairash
+git remote -v                            # should list the github URL
+```
+
+#### Common pitfalls
+- **Poetry not on PATH** → install put it in `~/.local/bin`; add that to `PATH` in `~/.bashrc`.
+- **`poetry install` builds `llama-cpp-python` and fails** with anaconda `compiler_compat/ld` errors about `GOMP_*` symbols. This is the issue documented under Phase 1 — `llama-cpp-python` is now an optional `serving` extra so the default install skips it. If you see this error you're on an older `pyproject.toml` — pull the latest commit.
+- **HF push fails with 403** → token wasn't write-scope. Generate a new one and re-run `huggingface-cli login`.
 
 ### Phase 1 — Data preparation (laptop, ~15 min) ✅ COMPLETED
 
@@ -372,17 +407,7 @@ Normally DPO needs **two copies** of the 7B model (policy + frozen reference) = 
 - TRL logs `rewards/chosen - rewards/rejected` (the "reward margin"). This should be **positive and growing** over training. If it's negative or flat, DPO is failing — likely a too-high LR or bad pairs.
 - Final loss < initial loss (DPO loss is ~0.69 = ln 2 at random init; should drop to ~0.4–0.5)
 
-### Phase 3 — Generate DPO pairs on Kaggle (~2–4 h)
-1. New notebook, T4x2, secrets `HF_TOKEN` + `OPENAI_API_KEY`.
-2. Upload `kaggle_02_generate_dpo_pairs.ipynb`, run all.
-- **Verify:** `Zubairash/medalign-dpo-pairs` has ~1.5–2k triples; spot-check `chosen` quality.
-
-### Phase 4 — DPO alignment on Kaggle (~3–6 h)
-1. New notebook, T4x2, `HF_TOKEN`.
-2. Upload `kaggle_03_dpo_alignment.ipynb`, run all.
-- **Verify:** `Zubairash/medalign-dpo-adapters` on HF; reward margin (`rewards/chosen - rewards/rejected`) > 0 and growing.
-
-### Phase 5 — RAG index build (laptop, ~20 min)
+### Phase 5 — RAG index build
 
 **Goal:** Build a searchable index of medical passages so that at inference time we can fetch relevant context and inject it into the prompt. This is **Retrieval-Augmented Generation (RAG)** — instead of relying on what the model memorized, it grounds answers in real documents and cites them.
 
@@ -447,40 +472,329 @@ embedder = SentenceTransformer(cfg["embedding"]["model"], device="cpu")
 Then `poetry run python scripts/build_rag_index.py`. Slow (~4–8 h) but no quality loss. Or swap in `BAAI/bge-small-en-v1.5` in `configs/rag.yaml` — fits any GPU and is much faster, with a small recall drop.
 
 ### Phase 6 — Quantization (laptop, ~1–2 h)
+
+**Goal:** Take the trained DPO adapters, fuse them into the base model, and produce 5 quantized GGUF files at different size/quality trade-offs. The result is a single self-contained file per quantization level that runs anywhere `llama.cpp` runs — no Python, no GPU required.
+
+#### Why GGUF
+- **Single-file format** with weights + tokenizer + chat template baked in.
+- **Memory-mapped** at load time → starts in seconds, not minutes.
+- **Portable**: same `.gguf` runs on CPU (laptop), Metal (Mac), CUDA (server), Android, even browsers via WASM.
+- **Quantizable** down to 2 bits per weight with minimal quality loss when paired with `imatrix`.
+
+#### Why 5 levels (Pareto exploration)
+
+| Level | Bits/weight | File size (7B) | Quality | When to use |
+|---|---|---|---|---|
+| `Q8_0` | 8.5 | ~7.7 GB | Near-lossless | Reference / quality ceiling |
+| `Q6_K` | 6.6 | ~5.9 GB | Indistinguishable from fp16 in eval | Best quality you'd actually ship |
+| `Q5_K_M` | 5.7 | ~5.1 GB | <1% perplexity hit | Good balance |
+| **`Q4_K_M`** | 4.8 | ~4.4 GB | ~2% perplexity hit | **Default** — best size/quality knee |
+| `Q4_K_S` | 4.6 | ~4.1 GB | ~3% perplexity hit | Smallest that still works on 8 GB RAM |
+
+We build all five so Phase 7 can plot the Pareto curve and pick the right one for each deployment target.
+
+#### What `imatrix` is, in plain words
+An "importance matrix" is a record of which weights light up most when you pass *real* text through the unquantized model. The quantizer reads this and gives more bits to high-impact weights and fewer bits to dead ones. Without imatrix every weight gets the same coarse quantization → unnecessary accuracy loss. With imatrix, accuracy loss drops by ~30–50% at the same bit-width.
+
+**Why a *medical* calibration corpus:** if we calibrated on Wikipedia, the imatrix would tell the quantizer "preserve weights that fire on Roman emperors and football scores" — irrelevant for our use case. By feeding it 2k PubMedQA + 2k MedQA chunks, we tell it "preserve weights that fire on drug names, anatomy, dosages." `scripts/build_calibration.py` produces `data/calibration_medical.txt`.
+
+#### Configuration (`configs/quant.yaml`)
+| Knob | Value | Meaning |
+|---|---|---|
+| `source.dpo_adapter_repo` | `Zubairash/medalign-dpo-adapters` | Phase 4 output to merge in |
+| `source.merged_dir` | `outputs/merged` | Where the merged fp16 HF checkpoint lands |
+| `llama_cpp.repo_url` | `https://github.com/ggerganov/llama.cpp` | Cloned + built on first run |
+| `quantization.levels` | `[Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q4_K_S]` | Pareto sweep |
+| `quantization.imatrix.calibration_text` | `data/calibration_medical.txt` | Corpus from `build_calibration.py` |
+
+#### What the scripts do, step by step
+
+**`scripts/build_calibration.py`** (1 file, runs first):
+1. Download 2,000 PubMedQA `pqa_artificial` rows and 2,000 medalpaca `medical_meadow_medqa` rows.
+2. From PubMedQA take the joined `context` field; from medqa format as `Q: …\nA: …`.
+3. Concatenate with blank-line separators → write to `data/calibration_medical.txt` (~2 MB).
+
+**`scripts/quantize_gguf.py`** (the main quantization pipeline):
+1. **`merge_adapter()`** (`scripts/quantize_gguf.py:11`) — load base Mistral in fp16, attach DPO adapters via `PeftModel.from_pretrained(...)`, call `.merge_and_unload()` to bake the LoRA deltas into the base weights, save to `outputs/merged/`. *After this step the model is no longer LoRA — it's a regular HF checkpoint with the medical knowledge fused in.*
+2. **Build llama.cpp** if `third_party/llama.cpp/` doesn't exist: `git clone` then `make -j`. Builds `llama-imatrix`, `llama-quantize`, and `convert_hf_to_gguf.py`.
+3. **Convert HF → GGUF fp16**: `python convert_hf_to_gguf.py outputs/merged/ --outfile outputs/gguf/model-f16.gguf --outtype f16` → ~14 GB.
+4. **Compute imatrix**: `llama-imatrix -m model-f16.gguf -f data/calibration_medical.txt -o outputs/gguf/imatrix.dat`. Takes ~10–20 min on CPU.
+5. **Loop quantize**: for each level in the config, run `llama-quantize --imatrix imatrix.dat model-f16.gguf model-{LEVEL}.gguf {LEVEL}`.
+
+#### Run
+
 ```bash
 poetry run python scripts/build_calibration.py
 poetry run python scripts/quantize_gguf.py
 ```
-- **Verify:** `outputs/gguf/model-{Q8_0,Q6_K,Q5_K_M,Q4_K_M,Q4_K_S}.gguf` (~7.7/5.9/5.1/4.4/4.1 GB for 7B).
+
+#### Verify
+- `outputs/merged/` contains `pytorch_model*.safetensors` + `tokenizer.json`
+- `outputs/gguf/` contains all 5 `.gguf` files plus `imatrix.dat` and `model-f16.gguf`
+- Sizes ≈ 7.7 / 5.9 / 5.1 / 4.4 / 4.1 GB
+- Sanity-check one file: `llama.cpp/llama-cli -m outputs/gguf/model-Q4_K_M.gguf -p "What is metformin?" -n 50`
+
+#### Common pitfalls
+- **`make` of llama.cpp fails with the same `GOMP_*` linker error from Phase 1.** Same root cause (anaconda `compiler_compat/ld`). Workarounds:
+  ```bash
+  cd third_party/llama.cpp && make GGML_OPENMP=0 -j
+  # or in a clean shell:
+  unset LD_LIBRARY_PATH; PATH=/usr/bin:$PATH make -j
+  ```
+- **Out of disk space**: the merged fp16 (~14 GB) + 5 quantized files + imatrix easily exceed 40 GB. Make sure `outputs/` lives on a partition with headroom.
+- **`merge_and_unload` OOMs on a small GPU**: `quantize_gguf.py` loads the merge in fp16 on whatever device PyTorch picks. Force CPU if needed by editing `merge_adapter` to pass `device_map="cpu"`.
 
 ### Phase 7 — Benchmarks (laptop)
-```bash
-poetry run python scripts/run_benchmarks.py --gguf outputs/gguf/model-Q4_K_M.gguf --out outputs/q4_norag.csv
-poetry run python scripts/run_benchmarks.py --gguf outputs/gguf/model-Q4_K_M.gguf --use-rag --out outputs/q4_rag.csv
+
+**Goal:** Numerically prove that each pipeline stage actually improved the model. Same test sets, same prompts, four model variants — and we want to see monotonic gains: **Base < SFT < DPO < DPO+RAG**.
+
+#### How accuracy is measured
+`scripts/run_benchmarks.py:25 evaluate()` does a naïve **substring match**: for each example, generate an answer, check if the gold string appears anywhere in the output. Fast, deterministic, noisy. Good for quick sanity checks. For higher-fidelity scoring, swap in the qualitative graders described below.
+
+#### Eval sets
+| Loader | Dataset | Subset | Format | Gold field |
+|---|---|---|---|---|
+| `load_pubmedqa` | `qiaojin/PubMedQA` | `pqa_labeled` (~1k) | yes/no/maybe | `final_decision` |
+| `load_medqa` | `GBaker/MedQA-USMLE-4-options` | `test` | 4-option MCQ | `answer` |
+| `load_medmcqa` | `openlifescienceai/medmcqa` | `validation` | MCQ | (loader exists, not wired into `main`) |
+
+Each run benchmarks 200 samples per dataset (cap inside `main()`).
+
+#### Generator wiring
+`make_llama_cpp_generator(gguf_path)` (`scripts/run_benchmarks.py:36`) wraps `llama_cpp.Llama` with **greedy decoding** (`temperature=0.0`), `max_tokens=128`, stops at `</s>` and `<|im_end|>`. Greedy ensures the same model gives the same answer twice — required for fair comparison.
+
+#### `--use-rag` flag
+When set:
+1. Load `configs/rag.yaml`.
+2. Instantiate `HybridRetriever` (FAISS + BM25 + cross-encoder reranker).
+3. For each question, fetch top-5 passages and prepend them as `[1] passage…\n[2] passage…\n` before the question.
+
+The model is then expected to cite as `[1]`, `[2]` in its answer.
+
+#### Concrete example
+
+**Without RAG** (PubMedQA prompt):
 ```
-Aggregate into the README results table comparing base / SFT / DPO / DPO+RAG. Use `medalign.eval.llm_judge.score_answer` and `medalign.eval.ragas_eval.evaluate_rag` for qualitative metrics.
-- **Verify:** monotonic improvement base < SFT < DPO < DPO+RAG.
+Question: Does aspirin reduce the risk of myocardial infarction in healthy adults?
+Answer:
+```
+
+**With RAG** (same question, top-2 context shown):
+```
+Context:
+[1] A meta-analysis of 6 randomized trials found that low-dose aspirin reduced…
+[2] The Physicians' Health Study showed a 44% reduction in first MI in men…
+Question: Does aspirin reduce the risk of myocardial infarction in healthy adults?
+Answer:
+```
+
+#### Qualitative metrics (optional, more expensive)
+- **`medalign.eval.llm_judge.score_answer`** — calls GPT-4o-mini with a rubric rating accuracy / safety / completeness / citations on a 1–5 scale. Use for nuanced answers where substring match is too coarse.
+- **`medalign.eval.ragas_eval.evaluate_rag`** — wraps RAGAS metrics: `faithfulness` (does the answer match the context?), `answer_relevancy`, `context_precision`, `context_recall`. Only meaningful when `--use-rag` is on.
+
+#### Prerequisite
+`llama-cpp-python` must be installed. Use the OpenMP-disabled command from Phase 1's known-issue block:
+```bash
+CMAKE_ARGS="-DGGML_OPENMP=OFF" poetry run pip install llama-cpp-python==0.3.20
+```
+
+#### Run
+
+```bash
+# Base / SFT / DPO would each require swapping the merged checkpoint and re-quantizing,
+# so the typical workflow is to benchmark only the final DPO model with and without RAG.
+poetry run python scripts/run_benchmarks.py \
+  --gguf outputs/gguf/model-Q4_K_M.gguf --out outputs/q4_norag.csv
+
+poetry run python scripts/run_benchmarks.py \
+  --gguf outputs/gguf/model-Q4_K_M.gguf --use-rag --out outputs/q4_rag.csv
+```
+
+Aggregate the CSVs into the README results table comparing base / SFT / DPO / DPO+RAG.
+
+#### Verify
+- Both CSVs land in `outputs/`
+- Each row: `benchmark, accuracy` with values in [0,1]
+- Monotonic improvement: PubMedQA accuracy with RAG should be at least 5–10 points higher than without
 
 ### Phase 8 — Serving (laptop)
+
+**Goal:** Wrap the quantized model + RAG retriever in a single process that exposes both an HTTP API (FastAPI) and an optional web UI (Gradio). Same `answer_fn` powers both, so behavior is identical.
+
+#### Architecture
+
+```
+                  ┌──────────────────────────┐
+HTTP POST /ask ──►│                          │
+                  │      build_app()         │
+Gradio UI     ───►│  ┌────────────────────┐  │
+                  │  │     answer_fn      │  │
+                  │  │  ─────────────     │  │
+                  │  │  (optional) RAG    │  │
+                  │  │  HybridRetriever   │  │
+                  │  │       │            │  │
+                  │  │       ▼            │  │
+                  │  │ ChatML prompt      │  │
+                  │  │       │            │  │
+                  │  │       ▼            │  │
+                  │  │  llama_cpp.Llama   │  │
+                  │  │  (Q4_K_M.gguf)     │  │
+                  │  └────────────────────┘  │
+                  └──────────────────────────┘
+```
+
+`build_app(gguf_path, use_rag)` (`scripts/serve.py:7`) returns `(FastAPI app, answer_fn)`. The `answer_fn` is reused by both the FastAPI route and Gradio so a bug fix in one fixes both.
+
+#### Prompt template
+
+**Without RAG** (`scripts/serve.py:25`):
+```
+<|im_start|>user
+{question}<|im_end|>
+<|im_start|>assistant
+```
+
+**With RAG** (`scripts/serve.py:30–34`):
+```
+<|im_start|>system
+Answer using ONLY the context. Cite as [#].<|im_end|>
+<|im_start|>user
+Context:
+[1] {passage 1}
+[2] {passage 2}
+...
+Question: {question}<|im_end|>
+<|im_start|>assistant
+```
+
+The system instruction forces the model to ground its answer in the context and cite sources — which is exactly what we want for medical Q&A where hallucinations are dangerous.
+
+#### Sampling
+- `temperature=0.2` — slightly creative but mostly deterministic
+- `max_tokens=512` — enough room for a paragraph + citations
+- `stop=["<|im_end|>"]` — clean termination at the assistant's turn end
+
+#### `/ask` endpoint
+Pydantic schema:
+```python
+class Query(BaseModel):
+    question: str
+```
+Returns:
+```json
+{
+  "answer": "First-line treatment for type 2 diabetes is metformin [1]...",
+  "sources": ["A meta-analysis of...", "Per ADA 2024 guidelines..."]
+}
+```
+`sources` are 200-character previews of the retrieved passages (when RAG is on).
+
+#### Gradio mode
+Two `Textbox` outputs (Answer + Sources), launched on the same port. Same `answer_fn` invoked under the hood.
+
+#### Docker
+The `Dockerfile` uses Python 3.10-slim, runs `poetry install`, and the default CMD launches `serve.py --gguf /models/model-Q4_K_M.gguf --use-rag` on port 8000. Mount the GGUF directory at runtime:
 ```bash
+docker build -t medalign .
+docker run -p 8000:8000 -v $PWD/outputs/gguf:/models medalign
+```
+
+#### Run
+
+```bash
+# FastAPI only
 poetry run python scripts/serve.py --gguf outputs/gguf/model-Q4_K_M.gguf --use-rag
+
+# In another terminal:
 curl -X POST localhost:8000/ask -H 'content-type: application/json' \
   -d '{"question": "What are first-line treatments for type 2 diabetes?"}'
 
-poetry run python scripts/serve.py --gguf outputs/gguf/model-Q4_K_M.gguf --use-rag --gradio --port 7860
+# Gradio UI
+poetry run python scripts/serve.py \
+  --gguf outputs/gguf/model-Q4_K_M.gguf --use-rag --gradio --port 7860
 ```
-Optional: `docker build -t medalign . && docker run -p 8000:8000 -v $PWD/outputs/gguf:/models medalign`.
+
+#### Verify
+- HTTP 200 from `/ask`
+- Response JSON has a non-empty `answer` and at least one `[1]` citation when `--use-rag` is on
+- Latency ~5–15 sec on CPU laptop, sub-second on GPU
 
 ### Phase 9 — Deploy demo to HuggingFace Spaces
-1. Create Space: SDK Gradio, hardware CPU basic.
-2. Push the Q4_K_M GGUF + a small `app.py` that imports `build_app` from `serve.py`.
-3. Link the Space from `README.md`.
+
+**Goal:** Put a public, shareable medical Q&A demo online with zero infrastructure cost. Reviewers click a URL and try the model — no install, no auth.
+
+#### Why HF Spaces (vs. Render / Fly / Vercel)
+- **Free CPU basic tier** (16 GB RAM, 2 vCPU) — enough for Q4_K_M GGUF at ~5–10 tok/s
+- **Native Gradio SDK** — one-click deploy from a `gradio.Interface`
+- **Lives next to the model** — `huggingface.co/spaces/Zubairash/...` pulls the GGUF straight from your HF Hub repo
+
+#### What to push to the Space
+| File | Purpose |
+|---|---|
+| `app.py` | 3-line wrapper: `from serve import build_app; _, answer_fn = build_app("model-Q4_K_M.gguf", use_rag=True); gr.Interface(...).launch()` |
+| `requirements.txt` | `llama-cpp-python`, `sentence-transformers`, `faiss-cpu`, `rank-bm25`, `gradio`, `huggingface_hub` |
+| `model-Q4_K_M.gguf` | Via Git LFS, or pull at boot from `Zubairash/medalign-gguf` |
+| `data/rag/*` | Pull from `Zubairash/medalign-rag-index` at boot to avoid bloating the Space repo |
+
+#### Step by step
+1. https://huggingface.co/new-space → name `medalign-demo`, SDK **Gradio**, hardware **CPU basic**.
+2. `git clone https://huggingface.co/spaces/Zubairash/medalign-demo`
+3. Copy `serve.py`, write the minimal `app.py`, commit + push (LFS for the GGUF).
+4. Watch the Space build log; first build takes ~5 min.
+5. Add the Space URL to `README.md`.
+
+#### Verify
+- Space URL loads the Gradio UI
+- Sample question "What is metformin used for?" returns a coherent answer with at least one citation
 
 ### Phase 10 — Polish
-- `make test` (unit tests).
-- Architecture diagram (Mermaid/PNG) in README.
-- Pareto chart from `medalign.quantization.benchmark.plot_pareto`.
-- Final commit + push.
+
+**Goal:** Make the repo presentable as a portfolio piece. Tests pass, diagrams render, results table filled in, README is the front door.
+
+#### Checklist with details
+
+1. **Run tests** — `make test` or `poetry run pytest tests/unit/ -v`. Should be green:
+   - `test_format.py` covers `to_chatml` + `dedup_minhash`
+   - `test_rrf.py` covers `reciprocal_rank_fusion`
+
+2. **Architecture diagram** — paste this Mermaid block into the README:
+   ```mermaid
+   flowchart LR
+       A[medalpaca datasets] --> B[Phase 1: dedup + ChatML]
+       B --> C[Phase 2: SFT QLoRA Kaggle]
+       C --> D[Phase 3: DPO pair gen + GPT-4o judge]
+       D --> E[Phase 4: DPO alignment Kaggle]
+       E --> F[Phase 6: merge + GGUF quantize]
+       G[PubMedQA corpus] --> H[Phase 5: BGE+BM25 RAG index]
+       F --> I[Phase 8: FastAPI + Gradio]
+       H --> I
+       I --> J[Phase 9: HF Space demo]
+   ```
+
+3. **Pareto chart** — after Phase 7, generate the size-vs-accuracy plot:
+   ```python
+   from medalign.quantization.benchmark import benchmark_gguf_variants, plot_pareto
+   rows = benchmark_gguf_variants("outputs/gguf", eval_fn=my_eval_fn, output_csv="outputs/pareto.csv")
+   plot_pareto(rows, out_png="docs/pareto.png")
+   ```
+   Embed `docs/pareto.png` in the README.
+
+4. **Fill the results table** in `README.md` from the Phase 7 CSVs:
+   ```
+   | Variant            | PubMedQA | MedQA-USMLE | MedMCQA |
+   | Base (Mistral-7B)  | …        | …           | —       |
+   | + SFT              | …        | …           | —       |
+   | + DPO              | …        | …           | —       |
+   | + DPO + RAG        | …        | …           | —       |
+   ```
+
+5. **Final commit + push** — `git add . && git commit -m "Phase 10: polish (diagrams, results, tests)" && git push origin main`.
+
+#### Verify
+- `make test` exits 0
+- README renders the Mermaid diagram, Pareto image, and a complete results table
+- HF Space demo URL is linked in the README and works
+- CI workflow on the latest commit is green
 
 ---
 
