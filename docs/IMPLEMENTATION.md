@@ -5,6 +5,95 @@ Comprehensive reference for what has been built and exactly how to run it end-to
 ## Project Goal
 Build a domain-adaptive medical LLM demonstrating ownership of the entire modern LLM post-training lifecycle: **SFT → DPO alignment → Hybrid RAG → GGUF quantization → FastAPI/Gradio serving**. Same pipeline shape as InstructGPT→RLHF / Llama post-training, scaled to a single 16 GB consumer GPU via QLoRA.
 
+## Design Decisions & Rationale
+
+This section answers **"why this and not X?"** for every important choice in the pipeline, in one place. Per-phase sections still contain deep dives — this is the high-level reference.
+
+Each decision below uses the same four-part template:
+- **What** we picked
+- **Why** it fits this project
+- **Alternatives** that were on the table
+- **Trade-off** we accepted
+
+---
+
+### 1. Base model — Mistral-7B-Instruct-v0.3
+- **Why:** 7B fits Kaggle T4 in 4-bit (~4 GB VRAM for weights, leaves room for activations). Already instruction-tuned, so SFT only has to *specialize* the domain rather than teach the model how to follow instructions from scratch. Apache-2.0 license. Strong English coverage. 32k native context window — plenty for medical Q&A with retrieved passages.
+- **Alternatives:** Llama-3-8B (worse 4-bit perplexity at this scale, more restrictive license), Gemma-7B (weaker on biomedical benchmarks), Phi-3-mini (too small to make a meaningful 7B-class comparison), BioMistral-7B (already medical-specialized — defeats the *point* of demonstrating the post-training pipeline ourselves).
+- **Trade-off:** Smaller than current frontier 70B+ models. Acceptable because the entire pipeline must finish on free Kaggle GPUs and the goal is to show the *process*, not chase SOTA.
+
+### 2. SFT corpus — `medalpaca/medical_meadow_{medqa, wikidoc}`
+- **Why:** Public, instruction-formatted, mixes USMLE-style multiple-choice (medqa) with open-ended Q&A (wikidoc). 18k unique rows after MinHash dedup is enough for QLoRA domain adaptation without overfitting.
+- **Alternatives:** PubMedQA-train (yes/no/maybe only — too narrow a label space for SFT), MedDialog (raw chat transcripts, no instruction format), HealthCareMagic-100k (noisy, license unclear), ClinicalQA (small).
+- **Trade-off:** medalpaca's `instruction` column is a constant prompt template; the actual question lives in `input`. We discovered this the hard way (Phase 1 dedup-collapsed-to-2-rows bug). Now mitigated by concatenating both columns before dedup.
+
+### 3. Prompt format — Mistral ChatML (`<|im_start|>system/user/assistant`)
+- **Why:** This is the exact format Mistral-7B-Instruct was trained on. Using a different format at SFT time would force the model to *re-learn* role boundaries, wasting training capacity.
+- **Alternatives:** Alpaca format (`### Instruction / ### Response`), Llama-3 chat tags, raw `Q:/A:`.
+- **Trade-off:** Locks the adapters to Mistral's tokenizer. Switching base models later means re-formatting and re-training.
+
+### 4. Deduplication — MinHash LSH @ 0.85 Jaccard
+- **Why:** Medical datasets duplicate stems heavily ("A 23-year-old presents with…"). Exact-match dedup misses near-duplicates; embedding-based dedup is expensive at scale. MinHash LSH is sublinear, runs in seconds on 20k rows, and 0.85 is the standard "fuzzy but not aggressive" threshold from the QLoRA + Llama 2 papers.
+- **Alternatives:** Exact match (misses paraphrases), SimHash (similar quality, slightly slower), semantic dedup with BGE embeddings (10× slower, marginal gain on this corpus).
+- **Trade-off:** Token-based — won't catch semantic duplicates with totally different wording, but those are rare in medqa/wikidoc.
+
+### 5. Fine-tuning method — QLoRA (4-bit NF4 + LoRA r=16)
+- **Why:** Full fine-tuning of a 7B model needs ~80 GB VRAM. **QLoRA**: freeze the base in 4-bit NF4 (~4 GB) and train tiny LoRA adapter matrices (~40 MB). Empirically matches full fine-tuning within 1% on most benchmarks. The adapter is portable and stack-able with subsequent DPO.
+- **Alternatives:** Full FT (impossible on T4), LoRA without 4-bit quantization (still ~14 GB, too tight on T4 with batch size > 1), prefix tuning (worse quality), prompt tuning (much worse), GaLore (newer, less stable on T4).
+- **Trade-off:** 4-bit weights have a small perplexity penalty; mitigated by `bnb_4bit_compute_dtype=bfloat16` so matmuls still happen in bf16.
+
+### 6. LoRA rank/alpha — `r=16, α=32` on all 7 projection layers
+- **Why:** r=16 is the empirical sweet spot for 7B-class models (Hu et al. 2021 LoRA paper + QLoRA paper). The α/r=2.0 scaling rule is the well-tested default. Applying LoRA to **all 7 projections** (`q, k, v, o, gate, up, down`) consistently beats attention-only for instruction following — the MLP layers are where most domain knowledge lives.
+- **Alternatives:** r=8 (under-fits when adapting to a new domain), r=64 (more params, marginal quality gain, slower), attention-only (cheaper but visibly worse on multi-step reasoning).
+- **Trade-off:** ~41M trainable params vs ~16M for attention-only — still <1% of the 7B base.
+
+### 7. Alignment method — DPO instead of PPO/RLHF
+- **Why:** **DPO eliminates the reward model entirely** — one loss, one optimizer. Mathematically equivalent to KL-constrained RLHF when β is chosen correctly (DPO paper, Rafailov et al. 2023). Fits on Kaggle T4x2 because it doesn't need separate reward model + reference model + value head.
+- **Alternatives:** PPO+reward model (4× the GPU memory, much more code to maintain), KTO (newer, less validated on medical domains), IPO (more conservative, often weaker), ORPO (skips SFT entirely — but we want the SFT step for the portfolio narrative).
+- **Trade-off:** DPO is sensitive to bad preference pairs; we mitigate this with a GPT-4o-mini judge in Phase 3 instead of self-rated heuristics.
+
+### 8. Preference pair generation — dual-temperature self-sampling + GPT-4o-mini judge
+- **Why:** Sampling at T=0.3 produces the model's safe boilerplate answer; sampling at T=0.9 produces a more exploratory answer. The contrast between them is what makes the preference signal learnable. Using the same model for both samples means we're teaching it to prefer its *own* better behavior. **GPT-4o-mini** as judge is cheap (~$0.005/pair) and good enough for binary "which answer is better" decisions — paying for GPT-4 would 20× the cost for ~5% quality gain.
+- **Alternatives:** Human annotation (expensive, slow, doesn't scale), reward-model scoring (chicken-and-egg — we'd need to train one first), constitutional-AI self-critique (less reliable when factual accuracy matters).
+- **Trade-off:** The judge bounds the upper quality of the dataset; if the judge is wrong, DPO learns the wrong thing. For medical Q&A, GPT-4o-mini's accuracy is well-documented as solid for this kind of binary choice.
+
+### 9. PEFT-DPO trick — `ref_model=None`
+- **Why:** Naïve DPO needs **two full 7B copies in memory** (policy + frozen reference) ≈ 28 GB. Won't fit T4. The trick: load the base once, define the policy as `base + trainable LoRA`, and use the *adapter-disabled base* as the reference at runtime. PEFT lets us toggle the LoRA on/off in-place. Saves ~14 GB → fits on T4.
+- **Alternatives:** Two full models (won't fit), gradient checkpointing the reference (slow), int8 reference model (precision drift breaks DPO).
+- **Trade-off:** None practically — this is now the standard PEFT-DPO recipe used by HuggingFace TRL.
+
+### 10. Retrieval — Hybrid (dense BGE + sparse BM25 + RRF + cross-encoder rerank)
+- **Why:** Dense alone misses exact medical jargon (drug names, dosages, ICD codes); sparse alone misses paraphrases ("chest pain" ≈ "thoracic discomfort"). **Reciprocal Rank Fusion (RRF)** combines both ranks without needing score calibration between the two systems. A **cross-encoder reranker** on the top-20 gives joint (query, doc) scoring — much more accurate than independent embeddings — but only at the cost of 20 forward passes instead of 211k, so it stays cheap.
+- **Alternatives:** ColBERT (multi-vector index, heavier, marginal quality gain), pure BM25 (misses semantic matches), pure dense (misses jargon), learned-to-rank (would need labeled training data we don't have).
+- **Trade-off:** Three indices to maintain (FAISS + BM25 + reranker model); the reranker adds ~50 ms latency per query.
+
+### 11. Embedding model — `BAAI/bge-large-en-v1.5`
+- **Why:** Top open-source dense retriever in MTEB English at the time of build. 1024-dim, normalized → cosine similarity ≡ inner product → use FAISS's fastest exact index (`IndexFlatIP`). Apache-2.0 license, no API lock-in.
+- **Alternatives:** OpenAI `text-embedding-3-small` (paid, vendor lock-in, requires internet at serve time), `e5-large-v2` (slightly weaker on biomedical), `jina-embeddings-v2` (longer context but lower quality on medical), ColBERT (multi-vector, complex index).
+- **Trade-off:** 335M parameters → needs a real GPU to embed 211k passages efficiently. Caused the Phase 5 OOM on a 3.6 GB laptop GPU; we moved that step to Kaggle.
+
+### 12. Inference format — GGUF via llama.cpp
+- **Why:** **Single mmap-able file** with weights + tokenizer + chat template baked in. Runs anywhere llama.cpp runs (CPU, Metal, CUDA, even WASM). No Python dependency at the C++ runtime layer. Supports advanced quantization (Q4_K_M, Q5_K_M, etc.) with imatrix calibration. De-facto ecosystem standard for local LLM serving.
+- **Alternatives:** vLLM (GPU-only, no CPU fallback for the demo HF Space), TGI (Docker-heavy, requires GPU), ONNX Runtime (worse quantization support for transformer architectures), AWQ/GPTQ (more accurate at 4-bit but ecosystem is fragmented and tooling moves slower).
+- **Trade-off:** GGUF tooling moves fast; conversion script names change between llama.cpp commits, occasionally requiring code updates.
+
+### 13. Quantization with imatrix calibration on a *medical* corpus
+- **Why:** An "importance matrix" records which weights light up most when real text passes through the unquantized model. The quantizer reads it and gives more bits to important weights. **By calibrating on PubMedQA + MedQA chunks** (instead of generic Wikitext), we ensure the surviving precision goes where it helps medical accuracy — not weights that fire on Roman emperors or football scores.
+- **Alternatives:** Uniform quantization without imatrix (30–50% bigger accuracy drop at the same bit-width), generic Wikitext imatrix (suboptimal for our domain), QAT / training-aware quantization (not supported by llama.cpp).
+- **Trade-off:** One extra ~10–20 minute step at the end of quantization to compute the imatrix.
+
+### 14. Serving — FastAPI + Gradio (shared `answer_fn`) + optional Docker
+- **Why:** **FastAPI** gives a typed Pydantic JSON API for programmatic access (curl, frontend apps, evals). **Gradio** gives a no-code web UI for demos and HF Spaces. Both share the same `answer_fn` inside `build_app()` so a fix in one fixes both. **Docker** for one-command reproducibility.
+- **Alternatives:** Streamlit (slower for interactive Q&A, no clean API/UI split), Flask (no async, no Pydantic schemas), Triton Inference Server (overkill for a single-model demo).
+- **Trade-off:** Two web frameworks in the deps tree, but the shared `build_app()` keeps logic duplication near zero.
+
+### 15. Infrastructure — Laptop ↔ Hugging Face Hub ↔ Kaggle T4x2
+- **Why:** **Free GPU for training** (Kaggle), **free artifact registry that doubles as model distribution** (HF Hub — every adapter, dataset, and GGUF is publicly browsable), **laptop for everything CPU-bound**. Portfolio-friendly because reviewers can click through the actual artifacts on HF.
+- **Alternatives:** Google Colab (worse GPU time limits, no T4x2), Lambda/RunPod (paid), local training (impossible without a real GPU), private S3 (no portfolio visibility).
+- **Trade-off:** Kaggle sessions cap at 12 hours per run, so every training phase must finish under that ceiling. We kept all four notebooks ≤6h each.
+
+---
+
 ## Execution Split
 | Stage | Where | Why |
 |---|---|---|
