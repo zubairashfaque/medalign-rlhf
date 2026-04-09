@@ -12,7 +12,7 @@ Build a domain-adaptive medical LLM demonstrating ownership of the entire modern
 | **SFT QLoRA (4-bit NF4)** | **Kaggle T4x2** | GPU |
 | **DPO preference-pair generation** | **Kaggle T4x2** | GPU sampling from SFT model |
 | **DPO alignment (TRL DPOTrainer)** | **Kaggle T4x2** | GPU |
-| RAG index build (BGE + BM25 + FAISS) | Laptop | CPU |
+| **RAG index build (BGE + BM25 + FAISS)** | **Kaggle T4** | GPU embedding (laptop GPU OOMs on BGE-large) |
 | GGUF quantization (llama.cpp) | Laptop | CPU |
 | Benchmarks (PubMedQA / MedQA / MedMCQA / RAGAS / LLM-judge) | Laptop | CPU/GPU |
 | Serving (FastAPI + Gradio) | Laptop | — |
@@ -415,12 +415,36 @@ The pipeline runs dense + sparse in parallel, fuses with **Reciprocal Rank Fusio
 
 These three files are everything `HybridRetriever` needs at serving time.
 
-#### Run it
+#### Where to run it — Kaggle (recommended)
+The original plan was "laptop, ~20 min" but BGE-large is a 335M-param transformer; embedding 211k passages is GPU-bound. On a small consumer GPU it OOMs (e.g. 3.6 GB GPU: `CUDA out of memory. Tried to allocate 512.00 MiB.`); on CPU it takes 4–8 hours. **Kaggle T4 finishes the same job in ~10–20 min.**
+
+So Phase 5 also moves to Kaggle, then the artifacts are mirrored to HF Hub and pulled back to the laptop where serving runs.
+
+**Kaggle notebook execution:**
+1. New notebook, **GPU T4 x1** (one is enough), **Internet On**.
+2. **Secret:** `HF_TOKEN`.
+3. Import `kaggle_notebooks/kaggle_04_build_rag_index.ipynb`. Run All.
+4. The notebook:
+   - Installs the repo + dependencies
+   - Pulls `configs/rag.yaml` + `scripts/build_rag_index.py` from GitHub
+   - Runs the build (BGE-large auto-uses CUDA)
+   - Pushes the 3 files to a new HF dataset `Zubairash/medalign-rag-index`
+
+**Then pull to laptop** (so Phases 7/8 can use it locally):
 ```bash
-poetry run python scripts/build_rag_index.py
+poetry run huggingface-cli download Zubairash/medalign-rag-index \
+  --repo-type dataset --local-dir data/rag
+ls -lh data/rag/
 ```
 
-**Verify:** `data/rag/faiss.index`, `data/rag/bm25.pkl`, `data/rag/meta.jsonl` all exist; FAISS file is ~800 MB (211k × 1024 × 4 bytes).
+**Verify:** `data/rag/faiss.index` (~800 MB = 211k × 1024 × 4 bytes), `data/rag/bm25.pkl`, `data/rag/meta.jsonl` all present locally.
+
+#### Laptop-only fallback (if you can't use Kaggle)
+Force CPU encoding by editing `scripts/build_rag_index.py`:
+```python
+embedder = SentenceTransformer(cfg["embedding"]["model"], device="cpu")
+```
+Then `poetry run python scripts/build_rag_index.py`. Slow (~4–8 h) but no quality loss. Or swap in `BAAI/bge-small-en-v1.5` in `configs/rag.yaml` — fits any GPU and is much faster, with a small recall drop.
 
 ### Phase 6 — Quantization (laptop, ~1–2 h)
 ```bash
