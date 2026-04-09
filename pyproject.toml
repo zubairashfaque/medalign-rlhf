@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "medalign"
+version = "0.1.0"
+description = "Domain-adaptive medical LLM: SFT -> DPO -> RAG -> GGUF"
+authors = ["Zubair Ashfaque"]
+readme = "README.md"
+packages = [{include = "medalign", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+transformers = ">=4.44"
+trl = ">=0.11"
+peft = ">=0.13"
+accelerate = ">=0.34"
+bitsandbytes = ">=0.43"
+datasets = ">=2.20"
+huggingface-hub = ">=0.25"
+sentence-transformers = ">=3.0"
+faiss-cpu = ">=1.8"
+rank-bm25 = ">=0.2.2"
+llama-cpp-python = ">=0.2.90"
+ragas = ">=0.1.20"
+fastapi = ">=0.115"
+uvicorn = ">=0.30"
+gradio = ">=4.44"
+pyyaml = ">=6.0"
+pydantic = ">=2.5"
+datasketch = ">=1.6"
+scikit-learn = ">=1.5"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+black = ">=24.0"
+ruff = ">=0.6"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

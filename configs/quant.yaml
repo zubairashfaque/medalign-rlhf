@@ -1,0 +1,19 @@
+source:
+  base_model: mistralai/Mistral-7B-Instruct-v0.3
+  dpo_adapter_repo: Zubairash/medalign-dpo-adapters
+  merged_dir: outputs/merged
+
+llama_cpp:
+  repo_url: https://github.com/ggerganov/llama.cpp
+  build_dir: third_party/llama.cpp
+
+quantization:
+  levels: [Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q4_K_S]
+  imatrix:
+    enabled: true
+    calibration_text: data/calibration_medical.txt
+  output_dir: outputs/gguf
+
+benchmark:
+  pubmedqa_subset: 200
+  output_csv: outputs/quant_benchmark.csv

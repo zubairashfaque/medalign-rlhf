@@ -1,0 +1,33 @@
+corpus:
+  dataset_id: qiaojin/PubMedQA
+  subset: pqa_artificial
+  text_field: context
+
+embedding:
+  model: BAAI/bge-large-en-v1.5
+  batch_size: 64
+  normalize: true
+
+index:
+  faiss_path: data/rag/faiss.index
+  bm25_path: data/rag/bm25.pkl
+  metadata_path: data/rag/meta.jsonl
+
+retrieval:
+  top_k_dense: 50
+  top_k_sparse: 50
+  rrf_k: 60
+  final_top_k: 5
+
+reranker:
+  model: cross-encoder/ms-marco-MiniLM-L-12-v2
+  enabled: true
+
+prompt:
+  require_citations: true
+  template: |
+    You are a medical assistant. Answer using ONLY the provided context. Cite sources as [#].
+    Context:
+    {context}
+    Question: {question}
+    Answer:
