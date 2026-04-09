@@ -10,17 +10,24 @@ from medalign.data.format import to_chatml, dedup_minhash
 
 
 SOURCES = [
-    ("medalpaca/medical_meadow_medqa", "instruction", "output"),
-    ("medalpaca/medical_meadow_wikidoc", "instruction", "output"),
+    ("medalpaca/medical_meadow_medqa", "instruction", "input", "output"),
+    ("medalpaca/medical_meadow_wikidoc", "instruction", "input", "output"),
 ]
 
 
 def load_all() -> Dataset:
     parts = []
-    for repo, instr_col, resp_col in SOURCES:
+    for repo, instr_col, input_col, resp_col in SOURCES:
         ds = load_dataset(repo, split="train")
         ds = ds.map(
-            lambda ex: {"instruction": ex[instr_col], "response": ex[resp_col]},
+            lambda ex: {
+                "instruction": (
+                    f"{ex[instr_col].strip()}\n\n{ex[input_col].strip()}"
+                    if ex.get(input_col)
+                    else ex[instr_col]
+                ),
+                "response": ex[resp_col],
+            },
             remove_columns=ds.column_names,
         )
         parts.append(ds)

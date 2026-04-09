@@ -161,12 +161,90 @@ PubMedQA `pqa_artificial` → BGE embeddings (batch 64, normalized) → `IndexFl
    poetry run huggingface-cli login   # paste HF token
    ```
 
-### Phase 1 — Data preparation (laptop, ~15 min)
+### Phase 1 — Data preparation (laptop, ~15 min) ✅ COMPLETED
+
 ```bash
 poetry run python scripts/prepare_sft_data.py --hub-repo Zubairash/medalign-sft
 ```
-- Downloads medqa + wikidoc, MinHash dedup, ChatML format, push to HF.
-- **Verify:** dataset visible at `https://huggingface.co/datasets/Zubairash/medalign-sft`; `data/sft/` exists locally.
+
+**Goal:** assemble a clean medical Q&A corpus, format it as Mistral ChatML, and push it to HF Hub so the Kaggle SFT notebook (Phase 2) can pull it down.
+
+**Pipeline (5 steps):**
+1. **Download** two medalpaca datasets — `medical_meadow_medqa` (USMLE multiple-choice, 10,178 rows) and `medical_meadow_wikidoc` (WikiDoc Q&A, 10,000 rows).
+2. **Dedup** with MinHash LSH (Jaccard ≥ 0.85) — removes near-duplicate questions so the model doesn't over-memorize repeated text. Implementation: `medalign.data.format.dedup_minhash`.
+3. **Cap** at 50,000 rows (`--max-samples`).
+4. **Format** each row into ChatML via `medalign.data.format.to_chatml` — the prompt template Mistral-7B-Instruct expects.
+5. **Save** to `data/sft/` as a HF Arrow dataset and **push** to `Zubairash/medalign-sft`.
+
+**Final result:** 20,178 raw → **18,146** after dedup → pushed.
+
+#### ⚠️ Bug found and fixed: medalpaca `instruction` column is a constant template
+
+The medalpaca datasets store the **fixed prompt template** in the `instruction` column and the **actual question** in the `input` column:
+
+| Dataset | `instruction` (constant for every row) | `input` (the real content) |
+|---|---|---|
+| medical_meadow_medqa | `"Please answer with one of the option in the bracket"` | `"A 23-year-old G1P0 woman at 22 weeks gestation presents with…"` |
+| medical_meadow_wikidoc | `"Answer this question truthfully"` | `"What are the symptoms of pancreatitis?"` |
+
+The original `prepare_sft_data.py` only read the `instruction` column, so MinHash dedup saw 20,178 copies of just **two unique strings** and kept exactly 2 rows. **Symptom in the logs:**
+```
+Loaded 20178 raw samples
+After dedup + cap: 2     ← broken
+```
+
+**Fix** (`scripts/prepare_sft_data.py`): extend `SOURCES` with an explicit `input_col` and concatenate `instruction + input` before dedup:
+```python
+SOURCES = [
+    ("medalpaca/medical_meadow_medqa", "instruction", "input", "output"),
+    ("medalpaca/medical_meadow_wikidoc", "instruction", "input", "output"),
+]
+# in load_all():
+ds = ds.map(lambda ex: {
+    "instruction": (
+        f"{ex[instr_col].strip()}\n\n{ex[input_col].strip()}"
+        if ex.get(input_col)
+        else ex[instr_col]
+    ),
+    "response": ex[resp_col],
+}, remove_columns=ds.column_names)
+```
+After the fix: 20,178 → **18,146** kept (~10% removed as near-duplicates — healthy ratio).
+
+#### Example of one finished training row (post-ChatML)
+```
+<|im_start|>system
+You are a careful medical assistant. Be accurate and cite uncertainty.<|im_end|>
+<|im_start|>user
+Please answer with one of the option in the bracket
+
+A 23-year-old G1P0 woman at 22 weeks gestation presents with vaginal bleeding…
+Which of the following is the most likely diagnosis?
+(A) Placenta previa  (B) Placental abruption  (C) Vasa previa  (D) Uterine rupture<|im_end|>
+<|im_start|>assistant
+(A) Placenta previa<|im_end|>
+```
+This `text` field is what `SFTTrainer` will tokenize in Phase 2.
+
+#### ⚠️ Build issue: `llama-cpp-python` made optional
+On this laptop `poetry install` failed building `llama-cpp-python==0.3.20` because Anaconda's `compiler_compat/ld` can't resolve OpenMP symbols (`GOMP_single_start@GOMP_1.0`, `GOMP_barrier@GOMP_1.0`) when linking `libggml-cpu.so`.
+
+**Why it's safe to skip:** `llama-cpp-python` is only imported lazily in `scripts/run_benchmarks.py` and `scripts/serve.py` (Phases 7–8). `quantize_gguf.py` does **not** use the Python package — it shells out to llama.cpp binaries it builds itself. Phases 1–6 don't need it.
+
+**Fix in `pyproject.toml`:** moved into a Poetry extra so default install skips it.
+```toml
+llama-cpp-python = { version = ">=0.2.90", optional = true }
+
+[tool.poetry.extras]
+serving = ["llama-cpp-python"]
+```
+**Before Phase 7**, install with the OpenMP-disabled workaround:
+```bash
+CMAKE_ARGS="-DGGML_OPENMP=OFF" poetry run pip install llama-cpp-python==0.3.20
+```
+`-DGGML_OPENMP=OFF` tells CMake to skip OpenMP entirely, sidestepping the linker issue. Tiny CPU-inference perf cost, no correctness impact.
+
+- **Verify:** dataset visible at `https://huggingface.co/datasets/Zubairash/medalign-sft`; `data/sft/` exists locally; row count ≈ 18k.
 
 ### Phase 2 — SFT QLoRA on Kaggle (~3–6 h)
 1. https://www.kaggle.com → New Notebook.

@@ -2012,9 +2012,10 @@ vcr = ["vcrpy (>=7.0.0)"]
 name = "llama-cpp-python"
 version = "0.3.20"
 description = "Python bindings for the llama.cpp library"
-optional = false
+optional = true
 python-versions = ">=3.8"
 groups = ["main"]
+markers = "extra == \"serving\""
 files = [
     {file = "llama_cpp_python-0.3.20.tar.gz", hash = "sha256:70f01b7d915d31c617dc66610a332cb2d51cde84c8b152d09a352206323616f5"},
 ]
@@ -5883,7 +5884,10 @@ files = [
 [package.extras]
 cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and python_version < \"3.14\"", "cffi (>=2.0.0b) ; platform_python_implementation != \"PyPy\" and python_version >= \"3.14\""]
 
+[extras]
+serving = ["llama-cpp-python"]
+
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "1eec217f2545afa7c12855e60a3aab96692b37a8f1dbc78110ae33aabf27f219"
+content-hash = "92384724e432b164d17c495d66ed61d77ff59c0d8fc293700ec5b9247b161756"
