@@ -16,10 +16,9 @@ def run_sft(config_path: str, hub_repo: str | None = None) -> str:
         AutoTokenizer,
         AutoModelForCausalLM,
         BitsAndBytesConfig,
-        TrainingArguments,
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from trl import SFTTrainer
+    from trl import SFTTrainer, SFTConfig
 
     cfg = yaml.safe_load(Path(config_path).read_text())
     m, l, t, d = cfg["model"], cfg["lora"], cfg["training"], cfg["data"]
@@ -56,7 +55,7 @@ def run_sft(config_path: str, hub_repo: str | None = None) -> str:
 
     dataset = load_dataset(d["dataset_id"], split="train")
 
-    args = TrainingArguments(
+    args = SFTConfig(
         output_dir=t["output_dir"],
         num_train_epochs=t["num_train_epochs"],
         per_device_train_batch_size=t["per_device_train_batch_size"],
@@ -69,16 +68,16 @@ def run_sft(config_path: str, hub_repo: str | None = None) -> str:
         save_steps=t["save_steps"],
         optim=t["optim"],
         report_to="none",
+        dataset_text_field="text",
+        max_seq_length=t["max_seq_length"],
+        packing=False,
     )
 
     trainer = SFTTrainer(
         model=model,
         args=args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
-        dataset_text_field="text",
-        max_seq_length=t["max_seq_length"],
-        packing=False,
+        processing_class=tokenizer,
     )
     trainer.train()
     trainer.save_model(t["output_dir"])

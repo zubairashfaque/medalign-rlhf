@@ -61,7 +61,7 @@ def run_dpo(config_path: str, hub_repo: str | None = None) -> str:
         ref_model=None,  # PEFT path: TRL uses adapter-disabled base as reference
         args=args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
     trainer.train()
     trainer.save_model(t["output_dir"])
