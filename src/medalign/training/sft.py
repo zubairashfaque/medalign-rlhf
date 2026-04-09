@@ -69,7 +69,7 @@ def run_sft(config_path: str, hub_repo: str | None = None) -> str:
         optim=t["optim"],
         report_to="none",
         dataset_text_field="text",
-        max_seq_length=t["max_seq_length"],
+        max_length=t["max_seq_length"],
         packing=False,
     )
 
