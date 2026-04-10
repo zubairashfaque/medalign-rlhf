@@ -28,7 +28,7 @@ def run_dpo(config_path: str, hub_repo: str | None = None) -> str:
     base = AutoModelForCausalLM.from_pretrained(
         m["base_model"],
         quantization_config=bnb,
-        device_map="auto",
+        device_map={"": 0},
         torch_dtype=torch.bfloat16,
     )
     # Policy = base + SFT adapters (trainable LoRA on top)

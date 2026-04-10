@@ -37,7 +37,7 @@ def run_sft(config_path: str, hub_repo: str | None = None) -> str:
     model = AutoModelForCausalLM.from_pretrained(
         m["base_model"],
         quantization_config=bnb,
-        device_map="auto",
+        device_map={"": 0},
         torch_dtype=torch.bfloat16,
     )
     model = prepare_model_for_kbit_training(model)
