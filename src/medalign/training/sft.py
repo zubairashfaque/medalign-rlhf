@@ -11,6 +11,9 @@ from pathlib import Path
 
 def run_sft(config_path: str, hub_repo: str | None = None) -> str:
     import torch
+    # Force single-GPU: prevent Trainer from wrapping in DataParallel
+    # (4-bit bnb tensors can't be replicated across devices)
+    torch.cuda.device_count = lambda: 1
     from datasets import load_dataset
     from transformers import (
         AutoTokenizer,
